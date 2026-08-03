@@ -80,7 +80,7 @@ After restarting Hermes, `web_search` and `web_extract` will route through the l
 
 ## Notes
 
-- Search uses Wikipedia JSON search as the backend; results are mapped to Firecrawl's response shape.
+- Search currently uses the Wikipedia JSON search API as the result backend and maps results into Firecrawl's response shape.
 - Crawl jobs are in-memory only and are lost on restart.
 - This project prioritizes low-resource operation over full Firecrawl feature parity.
 

@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "install:playwright": "playwright install chromium"
+    "install:playwright": "playwright install chromium",
+    "search": "python3 scripts/search_server.py 3003"
   },
   "dependencies": {
     "express": "^4.19.2",
@@ -15,5 +16,8 @@
     "p-limit": "^5.0.0",
     "p-retry": "^6.2.0",
     "cheerio": "^1.0.0-rc.12"
+  },
+  "optionalDependencies": {
+    "ddgs": "^9.14.4"
   }
 }

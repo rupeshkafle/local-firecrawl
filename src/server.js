@@ -7,6 +7,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
+const SEARCH_BACKEND_URL = (process.env.SEARCH_BACKEND_URL || '').trim();
 const PORT = process.env.PORT || 3002;
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_REQUESTS || 3);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 45000);
@@ -39,6 +40,27 @@ function htmlToMarkdown(html, url) {
 }
 
 async function searchOne(query) {
+  if (SEARCH_BACKEND_URL) {
+    try {
+      const base = SEARCH_BACKEND_URL.replace(/\/$/, '');
+      const searchUrl = `${base}/v2/search`;
+      const res = await fetch(searchUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ query, limit: 10 }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Search backend responded with status ${res.status}: ${text.slice(0, 120)}`);
+      }
+      const data = await res.json();
+      return data;
+    } catch (err) {
+      console.error('Search backend error:', err?.message || err);
+      return { data: { query, web: [] } };
+    }
+  }
+
   const url = new URL('https://en.wikipedia.org/w/api.php');
   url.searchParams.set('action', 'query');
   url.searchParams.set('list', 'search');
