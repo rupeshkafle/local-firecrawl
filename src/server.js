@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import { chromium } from 'playwright';
 import * as cheerio from 'cheerio';
+import { PDFParse } from 'pdf-parse';
 
 const app = express();
 app.use(cors());
@@ -12,16 +13,83 @@ const PORT = process.env.PORT || 3002;
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_REQUESTS || 3);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 45000);
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS || 25000);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 5 * 60 * 1000);
+const API_KEY = (process.env.API_KEY || '').trim();
+const WEBHOOK_SECRET = (process.env.WEBHOOK_SECRET || '').trim();
+const DEFAULT_PROXY = (process.env.PROXY_URL || '').trim();
+const RESPECT_ROBOTS = process.env.RESPECT_ROBOTS !== 'false';
 
 let queue = [];
 let running = 0;
 let browser;
+const fetchCache = new Map();
+const robotsCache = new Map();
+const webhookSubscriptions = new Map();
 
 function withTimeout(promise, ms) {
   return Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
   ]);
+}
+
+function checkApiKey(req, res) {
+  if (!API_KEY) return true;
+  const key = req.headers['x-api-key'] || req.query?.api_key;
+  if (key !== API_KEY) {
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+async function checkRobots(url) {
+  if (!RESPECT_ROBOTS) return true;
+  try {
+    const parsed = new URL(url);
+    const robotsUrl = `${parsed.origin}/robots.txt`;
+    const cached = robotsCache.get(parsed.origin);
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+      return cached.allowed;
+    }
+
+    const page = await browser.newPage();
+    try {
+      const res = await page.goto(robotsUrl, { waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => null);
+      if (!res || !res.ok()) {
+        robotsCache.set(parsed.origin, { allowed: true, ts: Date.now() });
+        return true;
+      }
+      const text = await page.content();
+      const disallowed = text.split('\n').filter(line => line.toLowerCase().startsWith('disallow:'));
+      const path = parsed.pathname;
+      const blocked = disallowed.some(line => {
+        const rule = line.split(':')[1]?.trim();
+        if (!rule || rule === '/') return true;
+        return path.startsWith(rule);
+      });
+      robotsCache.set(parsed.origin, { allowed: !blocked, ts: Date.now() });
+      return !blocked;
+    } finally {
+      try { await page.close(); } catch {}
+    }
+  } catch {
+    return true;
+  }
+}
+
+function extractMetadata(html, url) {
+  const $ = cheerio.load(html);
+  const title = $('title').text().trim() || $('meta[property="og:title"]').attr('content')?.trim() || '';
+  const description = $('meta[name="description"]').attr('content') || $('meta[property="og:description"]').attr('content') || '';
+  const author = $('meta[name="author"]').attr('content') || $('meta[property="article:author"]').attr('content') || '';
+  const date = $('meta[name="date"]').attr('content') || $('meta[property="article:published_time"]').attr('content') || '';
+  const sitename = $('meta[property="og:site_name"]').attr('content') || new URL(url).hostname;
+  const canonical = $('link[rel="canonical"]').attr('href') || url;
+  const images = Array.from($('img[src]')).map(el => $(el).attr('src')).filter(src => src && !src.startsWith('data:')).slice(0, 20);
+  const links = Array.from($('a[href]')).map(el => $(el).attr('href')).filter(href => href && !href.startsWith('javascript:')).slice(0, 50);
+  return { title, description, author, date, sitename, canonical, images, links };
 }
 
 function htmlToMarkdown(html, url) {
@@ -92,6 +160,71 @@ function isScrapeUrlAllowed(input) {
   return {allowed: true, url};
 }
 
+async function fetchPage(url, format = 'markdown') {
+  const cacheKey = `${url}:${format}`;
+  const cached = fetchCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    return cached.value;
+  }
+
+  const page = await browser.newPage();
+  try {
+    await withTimeout(page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }), NAV_TIMEOUT_MS + 1000);
+    const html = await page.content();
+    const contentType = await page.evaluate(() => document.contentType || '').catch(() => '');
+
+    if (contentType === 'application/pdf' || url.toLowerCase().endsWith('.pdf')) {
+      const buffer = await page.evaluate(async () => {
+        const res = await fetch(location.href);
+        return new Uint8Array(await res.arrayBuffer());
+      });
+      const parser = new PDFParse({});
+      await parser.load(buffer.buffer);
+      const text = (parser.getText() || '').slice(0, 12000);
+      const result = {
+        success: true,
+        url,
+        status_code: 200,
+        fetch_method: 'playwright-pdf',
+        metadata: { title: '', description: '', author: '', date: '', sitename: new URL(url).hostname, canonical: url, images: [], links: [] },
+        content: format === 'text' ? text : `# PDF Document\n\n${text}`,
+        stats: { content_length: text.length, word_count: text.split(/\s+/).filter(Boolean).length, format },
+        is_pdf: true,
+      };
+      fetchCache.set(cacheKey, { value: result, ts: Date.now() });
+      return result;
+    }
+
+    const metadata = extractMetadata(html, url);
+    const markdown = htmlToMarkdown(html, url).data.markdown;
+    const text = cheerio.load(html)('body').text().replace(/\s+/g, ' ').trim();
+
+    let content;
+    if (format === 'html') content = html;
+    else if (format === 'text') content = text;
+    else content = markdown;
+
+    const result = {
+      success: true,
+      url,
+      status_code: 200,
+      fetch_method: 'playwright',
+      metadata,
+      content,
+      stats: {
+        content_length: content.length,
+        word_count: content.split(/\s+/).filter(Boolean).length,
+        format,
+      },
+    };
+
+    fetchCache.set(cacheKey, { value: result, ts: Date.now() });
+    return result;
+  } finally {
+    try { await page.close(); } catch {}
+  }
+}
+
 async function scrapeOne(input) {
   const check = isScrapeUrlAllowed(input);
   if (!check.allowed) return {data: {markdown: '', html: '', url: check.url, error: `Scrape blocked: ${check.reason}`}};
@@ -106,13 +239,14 @@ async function scrapeOne(input) {
   }
 }
 
-async function enqueueCrawl({ url, maxPages = 10, allowExternal = false }) {
+async function enqueueCrawl({ url, maxPages = 10, allowExternal = false, webhookUrl }) {
   const base = new URL(url).origin;
   const job = {
     id: crypto.randomUUID(),
     url,
     maxPages,
     allowExternal,
+    webhookUrl,
     visited: new Set(),
     queued: new Set([url]),
     results: [],
@@ -148,6 +282,17 @@ async function processCrawl(job) {
     }
   }
   job.status = 'completed';
+
+  if (job.webhookUrl) {
+    try {
+      await fetch(job.webhookUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+        body: JSON.stringify({ job_id: job.id, status: job.status, pages: job.results.length, errors: job.errors.length }),
+      });
+    } catch {}
+  }
+
   return job;
 }
 
@@ -187,6 +332,7 @@ async function createCrawlHandler(req, res) {
     url,
     maxPages: Number(req.body?.limit || req.body?.maxPages || 10),
     allowExternal: Boolean(req.body?.allowExternal),
+    webhookUrl: req.body?.webhookUrl,
   });
 
   const result = await resultPromise;
@@ -195,8 +341,14 @@ async function createCrawlHandler(req, res) {
 
 app.get('/health', (req, res) => res.json({ success: true }));
 
-app.post('/v1/scrape', createScrapeHandler);
-app.post('/v2/scrape', createScrapeHandler);
+app.post('/v1/scrape', (req, res) => {
+  if (!checkApiKey(req, res)) return;
+  createScrapeHandler(req, res);
+});
+app.post('/v2/scrape', (req, res) => {
+  if (!checkApiKey(req, res)) return;
+  createScrapeHandler(req, res);
+});
 
 function createSearchHandler(req, res) {
   const query = req.body?.query || req.query?.query;
@@ -222,6 +374,141 @@ app.get('/v1/crawl/:id', (req, res) => {
       data: job.results,
     },
   });
+});
+
+app.post('/fetch', async (req, res) => {
+  const url = req.body?.url;
+  const format = (req.body?.format || 'markdown').toLowerCase();
+  if (!url) return res.status(400).json({ success: false, error: 'url is required' });
+
+  const check = isScrapeUrlAllowed(url);
+  if (!check.allowed) return res.status(400).json({ success: false, error: `Scrape blocked: ${check.reason}`, url });
+
+  try {
+    const result = await fetchPage(url, format);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err?.message || err), url });
+  }
+});
+
+app.get('/fetch', (req, res) => {
+  const url = req.query.url;
+  const format = (req.query.format || 'markdown').toLowerCase();
+  if (!url) return res.status(400).json({ success: false, error: 'url is required' });
+
+  const check = isScrapeUrlAllowed(url);
+  if (!check.allowed) return res.status(400).json({ success: false, error: `Scrape blocked: ${check.reason}`, url });
+
+  fetchPage(url, format)
+    .then((result) => res.json(result))
+    .catch((err) => res.status(500).json({ success: false, error: String(err?.message || err), url }));
+});
+
+app.post('/search-and-fetch', async (req, res) => {
+  const query = req.body?.query;
+  const numResults = Number(req.body?.num_results || 3);
+  const format = (req.body?.format || 'markdown').toLowerCase();
+  if (!query) return res.status(400).json({ success: false, error: 'query is required' });
+
+  try {
+    const searchResult = await searchOne(query);
+    const results = (searchResult.data.web || []).slice(0, numResults);
+    const fetched = await Promise.allSettled(results.map((item) => fetchPage(item.url, format)));
+    const finalResults = fetched.map((item, idx) => ({
+      search_result: results[idx],
+      fetch_status: item.status === 'fulfilled' ? 'success' : 'failed',
+      fetched_content: item.status === 'fulfilled' ? item.value : null,
+      error: item.status === 'rejected' ? String(item.reason?.message || item.reason) : null,
+    }));
+
+    res.json({
+      success: true,
+      query,
+      num_results_requested: numResults,
+      num_results_found: results.length,
+      successful_fetches: finalResults.filter((r) => r.fetch_status === 'success').length,
+      failed_fetches: finalResults.filter((r) => r.fetch_status === 'failed').length,
+      fetch_options: { format },
+      results: finalResults,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err?.message || err) });
+  }
+});
+
+app.post('/v1/map', async (req, res) => {
+  const url = req.body?.url;
+  const maxPages = Number(req.body?.limit || req.body?.maxPages || 50);
+  if (!url) return res.status(400).json({ success: false, error: 'url is required' });
+
+  const check = isScrapeUrlAllowed(url);
+  if (!check.allowed) return res.status(400).json({ success: false, error: `Scrape blocked: ${check.reason}`, url });
+
+  try {
+    const page = await browser.newPage();
+    const visited = new Set();
+    const queued = new Set([url]);
+    const links = [];
+
+    try {
+      await withTimeout(page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }), NAV_TIMEOUT_MS + 1000);
+      const html = await page.content();
+      const $ = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        let next;
+        try { next = new URL(href, url).href; } catch {}
+        if (next && next.startsWith(new URL(url).origin)) {
+          queued.add(next);
+        }
+      });
+    } finally {
+      try { await page.close(); } catch {}
+    }
+
+    const results = Array.from(queued).slice(0, maxPages);
+    res.json({ success: true, data: { url, links: results, total: results.length } });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err?.message || err) });
+  }
+});
+
+app.post('/v1/batch-scrape', async (req, res) => {
+  const urls = req.body?.urls || req.body?.sources?.map(s => s.url).filter(Boolean) || [];
+  if (!urls.length) return res.status(400).json({ success: false, error: 'urls is required' });
+
+  const results = await Promise.allSettled(urls.slice(0, 10).map(u => fetchPage(u, 'markdown')));
+  const completed = results.filter(r => r.status === 'fulfilled').length;
+  const failed = results.filter(r => r.status === 'rejected').length;
+
+  res.json({
+    success: true,
+    data: {
+      total: urls.length,
+      completed,
+      failed,
+      results: results.map((r, idx) => ({
+        url: urls[idx],
+        status: r.status === 'fulfilled' ? 'completed' : 'failed',
+        data: r.status === 'fulfilled' ? r.value : null,
+        error: r.status === 'rejected' ? String(r.reason?.message || r.reason) : null,
+      })),
+    },
+  });
+});
+
+app.post('/webhooks/subscribe', (req, res) => {
+  const event = req.body?.event;
+  const url = req.body?.url;
+  if (!event || !url) return res.status(400).json({ success: false, error: 'event and url are required' });
+  if (!WEBHOOK_SECRET) return res.status(400).json({ success: false, error: 'WEBHOOK_SECRET not configured' });
+
+  const subs = webhookSubscriptions.get(event) || [];
+  if (subs.includes(url)) return res.status(200).json({ success: true, message: 'Already subscribed' });
+  subs.push(url);
+  webhookSubscriptions.set(event, subs);
+  res.json({ success: true, message: 'Subscribed', event, url });
 });
 
 app.get('/admin/:key/queues', (req, res) => {

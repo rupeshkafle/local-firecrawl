@@ -10,12 +10,13 @@
     "search": "python3 scripts/search_server.py 3003"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "playwright": "^1.47.2",
+    "cheerio": "^1.0.0-rc.12",
     "cors": "^2.8.5",
+    "express": "^4.19.2",
     "p-limit": "^5.0.0",
     "p-retry": "^6.2.0",
-    "cheerio": "^1.0.0-rc.12"
+    "pdf-parse": "^2.4.5",
+    "playwright": "^1.47.2"
   },
   "optionalDependencies": {
     "ddgs": "^9.14.4"
