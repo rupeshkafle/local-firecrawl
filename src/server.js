@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import dns from 'node:dns';
 import { chromium } from 'playwright';
 import * as cheerio from 'cheerio';
 import { PDFParse } from 'pdf-parse';
@@ -7,6 +8,8 @@ import { PDFParse } from 'pdf-parse';
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+
+const dnsLookup = dns.promises.lookup;
 
 const SEARCH_BACKEND_URL = (process.env.SEARCH_BACKEND_URL || '').trim();
 const PORT = process.env.PORT || 3002;
@@ -22,6 +25,7 @@ const RESPECT_ROBOTS = process.env.RESPECT_ROBOTS !== 'false';
 let queue = [];
 let running = 0;
 let browser;
+let browserLaunching = null;
 const fetchCache = new Map();
 const robotsCache = new Map();
 const webhookSubscriptions = new Map();
@@ -33,9 +37,32 @@ function withTimeout(promise, ms) {
   ]);
 }
 
+// Lazily launch (or relaunch) the shared Playwright browser instance.
+// Boot no longer crashes the whole process if Chromium isn't installed yet -
+// /health and other non-scrape endpoints keep working, and we retry launch
+// on the next request that actually needs a page.
+async function ensureBrowser() {
+  if (browser) return browser;
+  if (browserLaunching) return browserLaunching;
+  browserLaunching = chromium
+    .launch({ headless: true, args: ['--disable-dev-shm-usage', '--no-sandbox'] })
+    .then((b) => {
+      browser = b;
+      browserLaunching = null;
+      return b;
+    })
+    .catch((err) => {
+      browserLaunching = null;
+      throw err;
+    });
+  return browserLaunching;
+}
+
 function checkApiKey(req, res) {
   if (!API_KEY) return true;
-  const key = req.headers['x-api-key'] || req.query?.api_key;
+  const authHeader = req.headers['authorization'] || '';
+  const bearerMatch = /^Bearer\s+(.+)$/i.exec(String(authHeader).trim());
+  const key = (bearerMatch ? bearerMatch[1].trim() : null) || req.headers['x-api-key'] || req.query?.api_key;
   if (key !== API_KEY) {
     res.setHeader('WWW-Authenticate', 'Bearer');
     res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -54,7 +81,7 @@ async function checkRobots(url) {
       return cached.allowed;
     }
 
-    const page = await browser.newPage();
+    const page = await (await ensureBrowser()).newPage();
     try {
       const res = await page.goto(robotsUrl, { waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => null);
       if (!res || !res.ok()) {
@@ -147,16 +174,68 @@ async function searchOne(query) {
   return { data: { query, web: results } };
 }
 
-function isScrapeUrlAllowed(input) {
+// --- SSRF guard helpers -----------------------------------------------------
+
+function isPrivateIPv4(ip) {
+  const parts = String(ip).split('.').map(Number);
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return false;
+  const [a, b] = parts;
+  if (a === 0) return true;               // 0.0.0.0/8
+  if (a === 127) return true;             // 127.0.0.0/8 loopback
+  if (a === 10) return true;              // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 (not all of 172.x)
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 - link-local + cloud metadata (169.254.169.254)
+  return false;
+}
+
+function isPrivateIPv6(ip) {
+  const lower = String(ip).toLowerCase();
+  if (lower === '::1' || lower === '::') return true; // loopback / unspecified
+  if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // fc00::/7 unique local
+  if (/^fe[89ab]/.test(lower)) return true; // fe80::/10 link-local
+  if (lower.startsWith('::ffff:')) {
+    // IPv4-mapped IPv6 address, e.g. ::ffff:127.0.0.1
+    const mapped = lower.split(':').pop();
+    return isPrivateIPv4(mapped);
+  }
+  return false;
+}
+
+// Resolves the hostname and blocks the request if either the literal
+// hostname or anything it resolves to (DNS rebinding) is a private,
+// loopback, link-local, or cloud-metadata address. Fails closed.
+async function isScrapeUrlAllowed(input) {
   const url = typeof input === 'string' ? input : input.url;
   let parsed;
   try { parsed = new URL(url); } catch { return {allowed: false, url, reason: 'Invalid URL'}; }
   if (!['http:', 'https:'].includes(parsed.protocol)) return {allowed: false, url, reason: 'Non-HTTP URL blocked'};
   const host = parsed.hostname;
   if (!host) return {allowed: false, url, reason: 'Missing host'};
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host.startsWith('127.') || host.startsWith('10.') || host.startsWith('192.168.') || host.startsWith('172.') || host.endsWith('.local') || host.endsWith('.internal')) return {allowed: false, url, reason: 'Private/internal host blocked'};
+
+  const lowerHost = host.toLowerCase();
+  if (
+    lowerHost === 'localhost' ||
+    lowerHost.endsWith('.local') ||
+    lowerHost.endsWith('.internal') ||
+    isPrivateIPv4(host) ||
+    isPrivateIPv6(host)
+  ) {
+    return {allowed: false, url, reason: 'Private/internal host blocked'};
+  }
+
   const port = parsed.port;
   if (port && !['80', '443', ''].includes(port)) return {allowed: false, url, reason: 'Non-standard port blocked'};
+
+  try {
+    const { address } = await dnsLookup(host);
+    if (isPrivateIPv4(address) || isPrivateIPv6(address)) {
+      return {allowed: false, url, reason: 'Host resolves to a private/internal address'};
+    }
+  } catch (err) {
+    return {allowed: false, url, reason: 'DNS resolution failed'};
+  }
+
   return {allowed: true, url};
 }
 
@@ -167,20 +246,35 @@ async function fetchPage(url, format = 'markdown') {
     return cached.value;
   }
 
-  const page = await browser.newPage();
+  const page = await (await ensureBrowser()).newPage();
   try {
     await withTimeout(page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }), NAV_TIMEOUT_MS + 1000);
     const html = await page.content();
     const contentType = await page.evaluate(() => document.contentType || '').catch(() => '');
 
     if (contentType === 'application/pdf' || url.toLowerCase().endsWith('.pdf')) {
-      const buffer = await page.evaluate(async () => {
+      const bytes = await page.evaluate(async () => {
         const res = await fetch(location.href);
-        return new Uint8Array(await res.arrayBuffer());
+        const buf = await res.arrayBuffer();
+        return Array.from(new Uint8Array(buf));
       });
-      const parser = new PDFParse({});
-      await parser.load(buffer.buffer);
-      const text = (parser.getText() || '').slice(0, 12000);
+
+      let text = '';
+      let parser;
+      try {
+        const pdfBuffer = Buffer.from(bytes);
+        parser = new PDFParse({ data: pdfBuffer });
+        const result = await parser.getText();
+        text = (result?.text || '').slice(0, 12000);
+      } catch (err) {
+        console.error('PDF parse error:', err?.message || err);
+        text = '';
+      } finally {
+        if (parser) {
+          try { await parser.destroy(); } catch {}
+        }
+      }
+
       const result = {
         success: true,
         url,
@@ -226,10 +320,10 @@ async function fetchPage(url, format = 'markdown') {
 }
 
 async function scrapeOne(input) {
-  const check = isScrapeUrlAllowed(input);
+  const check = await isScrapeUrlAllowed(input);
   if (!check.allowed) return {data: {markdown: '', html: '', url: check.url, error: `Scrape blocked: ${check.reason}`}};
   const url = check.url;
-  const page = await browser.newPage();
+  const page = await (await ensureBrowser()).newPage();
   try {
     await withTimeout(page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }), NAV_TIMEOUT_MS + 1000);
     const html = await page.content();
@@ -381,7 +475,7 @@ app.post('/fetch', async (req, res) => {
   const format = (req.body?.format || 'markdown').toLowerCase();
   if (!url) return res.status(400).json({ success: false, error: 'url is required' });
 
-  const check = isScrapeUrlAllowed(url);
+  const check = await isScrapeUrlAllowed(url);
   if (!check.allowed) return res.status(400).json({ success: false, error: `Scrape blocked: ${check.reason}`, url });
 
   try {
@@ -392,12 +486,12 @@ app.post('/fetch', async (req, res) => {
   }
 });
 
-app.get('/fetch', (req, res) => {
+app.get('/fetch', async (req, res) => {
   const url = req.query.url;
   const format = (req.query.format || 'markdown').toLowerCase();
   if (!url) return res.status(400).json({ success: false, error: 'url is required' });
 
-  const check = isScrapeUrlAllowed(url);
+  const check = await isScrapeUrlAllowed(url);
   if (!check.allowed) return res.status(400).json({ success: false, error: `Scrape blocked: ${check.reason}`, url });
 
   fetchPage(url, format)
@@ -442,11 +536,11 @@ app.post('/v1/map', async (req, res) => {
   const maxPages = Number(req.body?.limit || req.body?.maxPages || 50);
   if (!url) return res.status(400).json({ success: false, error: 'url is required' });
 
-  const check = isScrapeUrlAllowed(url);
+  const check = await isScrapeUrlAllowed(url);
   if (!check.allowed) return res.status(400).json({ success: false, error: `Scrape blocked: ${check.reason}`, url });
 
   try {
-    const page = await browser.newPage();
+    const page = await (await ensureBrowser()).newPage();
     const visited = new Set();
     const queued = new Set([url]);
     const links = [];
@@ -522,11 +616,10 @@ app.get('/admin/:key/queues', (req, res) => {
 app.listen(PORT, async () => {
   console.log(`Local Firecrawl compatible API starting on port ${PORT}`);
   try {
-    browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage', '--no-sandbox'] });
+    await ensureBrowser();
     console.log('Playwright browser ready');
   } catch (err) {
-    console.error('Failed to start Playwright browser:', err?.message || err);
+    console.error('Failed to start Playwright browser at boot (will retry lazily on first scrape request):', err?.message || err);
     console.error('Run: npx playwright install chromium');
-    process.exit(1);
   }
 });
