@@ -1,7 +1,33 @@
 #!/usr/bin/env python3
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
+import re
 from ddgs import DDGS
+
+
+AD_LINK_MARKERS = (
+    '/aclick',
+    'doubleclick.net',
+    'googleadservices.com',
+    'googlesyndication.com',
+)
+
+
+def is_ad_link(url):
+    lower = (url or '').lower()
+    return any(marker in lower for marker in AD_LINK_MARKERS)
+
+
+def clean_title(raw_title):
+    title = (raw_title or '').strip()
+    if '\u203a' in title:
+        title = title.rsplit('\u203a', 1)[-1].strip()
+    title = re.sub(r'^[a-z0-9]+(?:-[a-z0-9]+)*(?=[A-Z])', '', title)
+    return title.strip()
+
+
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
 
 
 class SearchHandler(BaseHTTPRequestHandler):
@@ -37,12 +63,12 @@ class SearchHandler(BaseHTTPRequestHandler):
 
         web = [
             {
-                'title': item.get('title', ''),
+                'title': clean_title(item.get('title', '')),
                 'url': item.get('href', ''),
                 'description': item.get('body', ''),
             }
             for item in results
-            if item.get('href')
+            if item.get('href') and not is_ad_link(item.get('href'))
         ]
         response = {'success': True, 'data': {'query': query, 'web': web}}
         self.send_response(200)
@@ -57,4 +83,4 @@ class SearchHandler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 3003
-    HTTPServer(('127.0.0.1', port), SearchHandler).serve_forever()
+    ReusableHTTPServer(('127.0.0.1', port), SearchHandler).serve_forever()
