@@ -1,12 +1,13 @@
 {
   "name": "local-firecrawl",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Lightweight local Firecrawl-compatible scraper",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
     "start": "node scripts/start.js",
     "start:server-only": "node src/server.js",
+    "postinstall": "playwright install chromium || echo 'Warning: automatic Playwright Chromium install failed. Run: npx playwright install chromium'",
     "install:playwright": "playwright install chromium",
     "search": "python3 scripts/search_server.py 3003"
   },
