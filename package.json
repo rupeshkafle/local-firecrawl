@@ -1,11 +1,12 @@
 {
   "name": "local-firecrawl",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Lightweight local Firecrawl-compatible scraper",
   "main": "src/server.js",
   "type": "module",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node scripts/start.js",
+    "start:server-only": "node src/server.js",
     "install:playwright": "playwright install chromium",
     "search": "python3 scripts/search_server.py 3003"
   },
@@ -17,8 +18,5 @@
     "p-retry": "^6.2.0",
     "pdf-parse": "^2.4.5",
     "playwright": "^1.47.2"
-  },
-  "optionalDependencies": {
-    "ddgs": "^9.14.4"
   }
 }
